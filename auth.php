@@ -375,10 +375,10 @@ class Auth {
     /* ============================================================
        LOGOUT
        ============================================================ */
-    public function logout() {
+    public function logout($hader) {
         session_unset();
         session_destroy();
-        header("Location:index.php");
+        header("Location:$hader");
         exit();
     }
 }
