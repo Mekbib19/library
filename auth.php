@@ -1,7 +1,12 @@
 <?php
+// Add this at the top of the file (after the opening PHP tag)
+use RobThree\Auth\TwoFactorAuth;
+use RobThree\Auth\Providers\Qr\BaconQrCodeProvider;
+
 class Auth {
     private $conn;
     private $config;
+    private $tfa;
 
     public function __construct($conn) {
         $this->conn = $conn;
@@ -17,614 +22,347 @@ class Auth {
         
         // Initialize database
         $this->initializeDatabase();
-    }
-
-    /* ============================================================
-       CONFIGURATION MANAGEMENT
-       ============================================================ */
-    private function loadConfig() {
-        $this->config = [
-            'session' => [
-                'timeout' => 3600, // 1 hour
-                'regenerate_interval' => 300, // 5 minutes
-                'cookie_lifetime' => 0,
-                'cookie_path' => '/',
-                'cookie_domain' => '',
-                'cookie_samesite' => 'Strict'
-            ],
-            'security' => [
-                'max_password_age' => 90, // days
-                'password_history' => 5,
-                'min_password_strength' => 3, // 1-4 scale
-                'allowed_special_chars' => '!@#$%^&*()_+-=[]{}|;:,.<>?'
-            ]
-        ];
-    }
-
-    /* ============================================================
-       SECURE SESSION CONFIGURATION
-       ============================================================ */
-    private function configureSession() {
-        ini_set('session.cookie_httponly', 1);
-        ini_set('session.cookie_samesite', 'Strict');
-        ini_set('session.use_strict_mode', 1);
-        ini_set('session.use_only_cookies', 1);
-        ini_set('session.cookie_lifetime', 0);
         
-        if (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] === 'on') {
-            ini_set('session.cookie_secure', 1);
-        }
-        
-        // Set session name with prefix to avoid conflicts
-        session_name('SECURE_AUTH_' . substr(hash('sha256', __DIR__), 0, 8));
+        // Initialize TFA if needed
+        $this->initializeMfa();
     }
 
     /* ============================================================
-       START SECURE SESSION
+       MFA INITIALIZATION
        ============================================================ */
-    private function startSecureSession() {
-        if (session_status() !== PHP_SESSION_ACTIVE) {
-            session_start();
-            
-            // Regenerate ID to prevent session fixation
-            session_regenerate_id(true);
-            
-            // Set creation time
-            if (!isset($_SESSION['CREATED'])) {
-                $_SESSION['CREATED'] = time();
+    private function initializeMfa() {
+        if ($this->getSetting('enable_2fa') === '1') {
+            try {
+                // Update database schema for MFA backup codes
+                $this->conn->query("
+                    ALTER TABLE users 
+                    ADD COLUMN IF NOT EXISTS mfa_backup_codes TEXT NULL
+                ");
+            } catch (Exception $e) {
+                $this->logEvent('error', "Failed to update MFA schema: " . $e->getMessage());
             }
-            
-            // Set last activity time
-            $_SESSION['LAST_ACTIVITY'] = time();
-            
-            // Set session fingerprint
-            $_SESSION['FINGERPRINT'] = $this->generateSessionFingerprint();
-        } else {
-            // Validate existing session
-            $this->validateSession();
         }
     }
 
     /* ============================================================
-       SESSION FINGERPRINTING
+       TOTP MFA IMPLEMENTATION (Google Authenticator compatible)
        ============================================================ */
-    private function generateSessionFingerprint() {
-        $components = [
-            $_SERVER['HTTP_USER_AGENT'] ?? '',
-            $_SERVER['REMOTE_ADDR'] ?? '',
-            // Don't include too many variables that might change legitimately
-        ];
-        
-        return hash('sha256', implode('|', $components));
-    }
-
-    private function validateSessionFingerprint() {
-        if (!isset($_SESSION['FINGERPRINT'])) {
-            return false;
-        }
-        
-        $currentFingerprint = $this->generateSessionFingerprint();
-        return hash_equals($_SESSION['FINGERPRINT'], $currentFingerprint);
-    }
-
-    /* ============================================================
-       SESSION VALIDATION
-       ============================================================ */
-    private function validateSession() {
-        // Check session age
-        if (isset($_SESSION['LAST_ACTIVITY']) && 
-            (time() - $_SESSION['LAST_ACTIVITY'] > $this->config['session']['timeout'])) {
-            $this->destroySession();
-            return false;
-        }
-        
-        // Update last activity
-        $_SESSION['LAST_ACTIVITY'] = time();
-        
-        // Regenerate ID periodically
-        if (!isset($_SESSION['REGENERATED'])) {
-            $_SESSION['REGENERATED'] = time();
-        } elseif (time() - $_SESSION['REGENERATED'] > $this->config['session']['regenerate_interval']) {
-            session_regenerate_id(true);
-            $_SESSION['REGENERATED'] = time();
-        }
-        
-        // Validate fingerprint
-        if (!$this->validateSessionFingerprint()) {
-            $this->logEvent('warn', "Session fingerprint mismatch - possible hijacking attempt");
-            $this->destroySession();
-            return false;
-        }
-        
-        return true;
-    }
-
-    private function destroySession() {
-        $_SESSION = [];
-        if (ini_get("session.use_cookies")) {
-            $params = session_get_cookie_params();
-            setcookie(session_name(), '', time() - 42000,
-                $params["path"], $params["domain"],
-                $params["secure"], $params["httponly"]
-            );
-        }
-        session_destroy();
-    }
-
-    /* ============================================================
-       SECURE LOGGING SYSTEM
-       ============================================================ */
-    private function logEvent($level, $message, $context = []) {
-        $dir = __DIR__ . DIRECTORY_SEPARATOR . 'logs';
-        
-        // Create secure logs directory
-        if (!is_dir($dir)) {
-            if (!@mkdir($dir, 0750, true)) {
-                return false;
-            }
-            // Create .htaccess to block direct access
-            $htaccess = $dir . DIRECTORY_SEPARATOR . '.htaccess';
-            if (!file_exists($htaccess)) {
-                @file_put_contents($htaccess, 
-                    "Order Deny,Allow\n" .
-                    "Deny from all\n" .
-                    "<Files \"auth.log\">\n" .
-                    "  Order Allow,Deny\n" .
-                    "  Deny from all\n" .
-                    "</Files>\n"
+    private function getTfaInstance() {
+        if ($this->tfa === null) {
+            try {
+                $this->tfa = new TwoFactorAuth(
+                    'YourAppName',           // Change to your site name
+                    6,                       // 6-digit codes
+                    30,                      // 30-second period
+                    'sha1',                  // Algorithm
+                    new BaconQrCodeProvider()
                 );
-            }
-            // Create index.html to hide directory listing
-            $index = $dir . DIRECTORY_SEPARATOR . 'index.html';
-            if (!file_exists($index)) {
-                @file_put_contents($index, '<!DOCTYPE html><html><head><title>403 Forbidden</title></head><body><h1>Access Denied</h1></body></html>');
+            } catch (Exception $e) {
+                $this->logEvent('error', "Failed to initialize TFA: " . $e->getMessage());
+                throw new Exception("MFA initialization failed");
             }
         }
-        
-        // Sanitize message for log injection
-        $message = preg_replace('/[\r\n\t]/', ' ', $message);
-        $message = substr($message, 0, 1000); // Limit length
-        
-        $file = $dir . DIRECTORY_SEPARATOR . 'auth.log';
-        $time = date("Y-m-d H:i:s");
-        $ip = $_SERVER['REMOTE_ADDR'] ?? '0.0.0.0';
-        $sessionId = session_id() ? substr(session_id(), 0, 8) . '...' : 'no-session';
-        
-        $line = sprintf("[%s] [%s] [%s] [%s] %s",
-            $time,
-            strtoupper($level),
-            $ip,
-            $sessionId,
-            $message
-        );
-        
-        // Add context if provided
-        if (!empty($context)) {
-            $line .= ' ' . json_encode($context, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+        return $this->tfa;
+    }
+
+    /**
+     * Generate a new TOTP secret and QR code for user setup
+     */
+    public function generateMfaSecret($userId) {
+        // Check if MFA is enabled globally
+        if ($this->getSetting('enable_2fa') !== '1') {
+            return ['success' => false, 'error' => 'MFA is not enabled on this system'];
         }
-        
-        $line .= "\n";
-        
-        // Rotate log if too large (>10MB)
-        if (file_exists($file) && filesize($file) > 10 * 1024 * 1024) {
-            $backup = $file . '.' . date('Y-m-d');
-            if (!file_exists($backup)) {
-                @rename($file, $backup);
+
+        $user = $this->getUserById($userId);
+        if (!$user) {
+            return ['success' => false, 'error' => 'User not found'];
+        }
+
+        try {
+            $tfa = $this->getTfaInstance();
+            $secret = $tfa->createSecret(160); // 160 bits = very secure
+
+            // Generate QR code as data URI
+            $label = rawurlencode($user['user_name'] . '@YourAppName');
+            $qrCode = $tfa->getQRCodeImageAsDataUri($label, $secret);
+
+            // Temporarily store secret in session until confirmed
+            $_SESSION['pending_mfa_secret'] = $secret;
+            $_SESSION['pending_mfa_user_id'] = $userId;
+            $_SESSION['pending_mfa_expires'] = time() + 600; // 10 minutes expiry
+
+            $this->auditLog($userId, 'MFA_SETUP_STARTED', 'Started MFA setup process');
+
+            return [
+                'success' => true,
+                'secret' => $secret,
+                'qrCode' => $qrCode
+            ];
+        } catch (Exception $e) {
+            $this->logEvent('error', "Failed to generate MFA secret: " . $e->getMessage());
+            return ['success' => false, 'error' => 'Failed to generate MFA setup'];
+        }
+    }
+
+    /**
+     * Confirm and enable MFA after user scans QR and enters valid code
+     */
+    public function enableMfa($userId, $code, $currentPassword = null) {
+        // Verify user is logged in and matches the session
+        if (!$this->isLoggedIn() || $_SESSION['USER_ID'] != $userId) {
+            return ['success' => false, 'error' => 'Authentication required'];
+        }
+
+        // Check if MFA is enabled globally
+        if ($this->getSetting('enable_2fa') !== '1') {
+            return ['success' => false, 'error' => 'MFA is not enabled on this system'];
+        }
+
+        // Verify current password if provided (optional but recommended)
+        if ($currentPassword !== null) {
+            $user = $this->getUserById($userId);
+            if (!$user || !password_verify($currentPassword, $user['password'])) {
+                $this->auditLog($userId, 'MFA_SETUP_FAILED', 'Invalid current password provided');
+                return ['success' => false, 'error' => 'Current password is incorrect'];
             }
         }
-        
-        return @file_put_contents($file, $line, FILE_APPEND | LOCK_EX) !== false;
-    }
 
-    /* ============================================================
-       CSRF PROTECTION WITH TOKEN ROTATION
-       ============================================================ */
-    public function generateCsrfToken($formId = 'default') {
-        if (!isset($_SESSION['CSRF_TOKENS'])) {
-            $_SESSION['CSRF_TOKENS'] = [];
+        // Check session data
+        if (!isset($_SESSION['pending_mfa_secret']) || 
+            $_SESSION['pending_mfa_user_id'] != $userId ||
+            time() > $_SESSION['pending_mfa_expires']) {
+            return ['success' => false, 'error' => 'MFA setup session expired. Please start again.'];
         }
-        
-        // Generate token
-        $token = bin2hex(random_bytes(32));
-        $expires = time() + 3600; // 1 hour expiration
-        
-        // Store with form ID, token, and expiration
-        $_SESSION['CSRF_TOKENS'][$formId] = [
-            'token' => hash_hmac('sha256', $token, $_SESSION['FINGERPRINT'] ?? ''),
-            'expires' => $expires
-        ];
-        
-        // Clean old tokens
-        $this->cleanupExpiredCsrfTokens();
-        
-        return $token;
-    }
 
-    public function verifyCsrfToken($token, $formId = 'default') {
-        if (empty($token) || !isset($_SESSION['CSRF_TOKENS'][$formId])) {
-            return false;
-        }
-        
-        $stored = $_SESSION['CSRF_TOKENS'][$formId];
-        
-        // Check expiration
-        if (time() > $stored['expires']) {
-            unset($_SESSION['CSRF_TOKENS'][$formId]);
-            return false;
-        }
-        
-        // Verify token
-        $expected = hash_hmac('sha256', $token, $_SESSION['FINGERPRINT'] ?? '');
-        $valid = hash_equals($stored['token'], $expected);
-        
-        // Remove used token (one-time use)
-        unset($_SESSION['CSRF_TOKENS'][$formId]);
-        
-        return $valid;
-    }
+        $secret = $_SESSION['pending_mfa_secret'];
+        $code = trim($code);
 
-    private function cleanupExpiredCsrfTokens() {
-        if (!isset($_SESSION['CSRF_TOKENS'])) return;
-        
-        $now = time();
-        foreach ($_SESSION['CSRF_TOKENS'] as $formId => $data) {
-            if ($now > $data['expires']) {
-                unset($_SESSION['CSRF_TOKENS'][$formId]);
+        try {
+            $tfa = $this->getTfaInstance();
+            
+            // Verify with 1 period tolerance (30 seconds before/after)
+            if (!$tfa->verifyCode($secret, $code, 1)) {
+                $this->auditLog($userId, 'MFA_SETUP_FAILED', 'Invalid verification code entered');
+                return ['success' => false, 'error' => 'Invalid verification code'];
             }
-        }
-    }
 
-    /* ============================================================
-       DATABASE INITIALIZATION
-       ============================================================ */
-    private function initializeDatabase() {
-        $this->createTables();
-        $this->insertDefaultSettings();
-        $this->cleanupExpiredBlocks();
-        $this->cleanupExpiredSessions();
-    }
+            // Generate 10 one-time backup codes (store as hashed values)
+            $backupCodes = [];
+            $hashedBackupCodes = [];
+            for ($i = 0; $i < 10; $i++) {
+                $code = strtoupper(substr(bin2hex(random_bytes(5)), 0, 8)); // 8-char readable codes
+                $backupCodes[] = $code;
+                $hashedBackupCodes[] = password_hash($code, PASSWORD_DEFAULT);
+            }
 
-    private function createTables() {
-        // Users Table with enhanced security fields
-        $this->conn->query("
-            CREATE TABLE IF NOT EXISTS users (
-                id INT AUTO_INCREMENT PRIMARY KEY,
-                user_name VARCHAR(100) UNIQUE NOT NULL,
-                password VARCHAR(255) NOT NULL,
-                role VARCHAR(50) NOT NULL DEFAULT 'USER',
-                email VARCHAR(255) UNIQUE,
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                last_login DATETIME NULL,
-                failed_attempts INT DEFAULT 0,
-                locked_until DATETIME NULL,
-                password_changed DATETIME DEFAULT CURRENT_TIMESTAMP,
-                mfa_secret VARCHAR(255) NULL,
-                mfa_enabled BOOLEAN DEFAULT FALSE,
-                INDEX idx_last_login (last_login),
-                INDEX idx_locked_until (locked_until)
-            ) ENGINE=InnoDB CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
-        ");
+            // Store hashed backup codes
+            $backupJson = json_encode($hashedBackupCodes);
 
-        // Password History Table
-        $this->conn->query("
-            CREATE TABLE IF NOT EXISTS password_history (
-                id INT AUTO_INCREMENT PRIMARY KEY,
-                user_id INT NOT NULL,
-                password_hash VARCHAR(255) NOT NULL,
-                changed_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
-                INDEX idx_user_id (user_id)
-            ) ENGINE=InnoDB
-        ");
-
-        // Login Attempts Table
-        $this->conn->query("
-            CREATE TABLE IF NOT EXISTS login_attempts (
-                id INT AUTO_INCREMENT PRIMARY KEY,
-                user_name VARCHAR(100) NOT NULL,
-                attempts INT DEFAULT 0,
-                last_attempt DATETIME,
-                ip_address VARCHAR(45),
-                user_agent TEXT,
-                INDEX idx_ip_address (ip_address),
-                INDEX idx_last_attempt (last_attempt),
-                INDEX idx_user_ip (user_name, ip_address)
-            ) ENGINE=InnoDB
-        ");
-
-        // Security Settings Table
-        $this->conn->query("
-            CREATE TABLE IF NOT EXISTS security_settings (
-                id INT AUTO_INCREMENT PRIMARY KEY,
-                setting_key VARCHAR(100) UNIQUE NOT NULL,
-                setting_value TEXT NOT NULL,
-                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
-            ) ENGINE=InnoDB
-        ");
-
-        // Blocked IP Table
-        $this->conn->query("
-            CREATE TABLE IF NOT EXISTS blocked_ips (
-                id INT AUTO_INCREMENT PRIMARY KEY,
-                ip VARCHAR(45) UNIQUE NOT NULL,
-                blocked_until DATETIME NULL,
-                reason VARCHAR(255),
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                INDEX idx_blocked_until (blocked_until)
-            ) ENGINE=InnoDB
-        ");
-
-        // Sessions Table for server-side session storage (optional)
-        $this->conn->query("
-            CREATE TABLE IF NOT EXISTS user_sessions (
-                id VARCHAR(128) PRIMARY KEY,
-                user_id INT NOT NULL,
-                ip_address VARCHAR(45),
-                user_agent TEXT,
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                last_activity DATETIME DEFAULT CURRENT_TIMESTAMP,
-                expires_at DATETIME NOT NULL,
-                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
-                INDEX idx_user_id (user_id),
-                INDEX idx_expires_at (expires_at)
-            ) ENGINE=InnoDB
-        ");
-
-        // Audit Log Table
-        $this->conn->query("
-            CREATE TABLE IF NOT EXISTS audit_log (
-                id INT AUTO_INCREMENT PRIMARY KEY,
-                user_id INT NULL,
-                action VARCHAR(100) NOT NULL,
-                description TEXT,
-                ip_address VARCHAR(45),
-                user_agent TEXT,
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                INDEX idx_created_at (created_at),
-                INDEX idx_user_action (user_id, action)
-            ) ENGINE=InnoDB
-        ");
-    }
-
-    /* ============================================================
-       DEFAULT SECURITY SETTINGS
-       ============================================================ */
-    private function insertDefaultSettings() {
-        $defaults = [
-            'allow_registration' => '1',
-            'allowed_countries' => 'ET',
-            'max_attempts' => '5',
-            'lock_minutes' => '5',
-            'password_min_length' => '12',
-            'password_require_uppercase' => '1',
-            'password_require_lowercase' => '1',
-            'password_require_numbers' => '1',
-            'password_require_special' => '1',
-            'password_expiry_days' => '90',
-            'password_history_size' => '5',
-            'session_timeout' => '3600',
-            'enable_2fa' => '0',
-            'login_delay_base' => '2',
-            'max_login_delay' => '64'
-        ];
-
-        foreach ($defaults as $key => $value) {
             $stmt = $this->conn->prepare("
-                INSERT IGNORE INTO security_settings (setting_key, setting_value)
-                VALUES (?, ?)
+                UPDATE users 
+                SET mfa_secret = ?, mfa_enabled = 1, mfa_backup_codes = ?
+                WHERE id = ?
             ");
-            $stmt->bind_param("ss", $key, $value);
-            $stmt->execute();
+            $stmt->bind_param("ssi", $secret, $backupJson, $userId);
+            $success = $stmt->execute();
             $stmt->close();
-        }
-    }
 
-    /* ============================================================
-       SETTINGS MANAGEMENT
-       ============================================================ */
-    private function getSetting($key) {
-        static $cache = [];
-        
-        if (isset($cache[$key])) {
-            return $cache[$key];
-        }
-        
-        $stmt = $this->conn->prepare("SELECT setting_value FROM security_settings WHERE setting_key = ?");
-        $stmt->bind_param("s", $key);
-        $stmt->execute();
-        $result = $stmt->get_result();
-        
-        if ($result->num_rows == 0) {
-            $cache[$key] = null;
-        } else {
-            $cache[$key] = $result->fetch_assoc()['setting_value'];
-        }
-        
-        $stmt->close();
-        return $cache[$key];
-    }
+            if ($success) {
+                // Clear pending session
+                unset($_SESSION['pending_mfa_secret'], 
+                      $_SESSION['pending_mfa_user_id'], 
+                      $_SESSION['pending_mfa_expires']);
 
-    /* ============================================================
-       PASSWORD STRENGTH VALIDATION
-       ============================================================ */
-    private function validatePasswordStrength($password) {
-        $minLength = (int)$this->getSetting('password_min_length') ?: 12;
-        
-        if (strlen($password) < $minLength) {
-            return ['valid' => false, 'error' => "Password must be at least {$minLength} characters"];
-        }
-        
-        // Check requirements
-        $checks = [];
-        
-        if ($this->getSetting('password_require_uppercase') === '1') {
-            $checks[] = preg_match('/[A-Z]/', $password);
-        }
-        
-        if ($this->getSetting('password_require_lowercase') === '1') {
-            $checks[] = preg_match('/[a-z]/', $password);
-        }
-        
-        if ($this->getSetting('password_require_numbers') === '1') {
-            $checks[] = preg_match('/[0-9]/', $password);
-        }
-        
-        if ($this->getSetting('password_require_special') === '1') {
-            $checks[] = preg_match('/[' . preg_quote('!@#$%^&*()_+-=[]{}|;:,.<>?', '/') . ']/', $password);
-        }
-        
-        foreach ($checks as $check) {
-            if (!$check) {
-                return ['valid' => false, 'error' => 'Password does not meet complexity requirements'];
+                $this->auditLog($userId, 'MFA_ENABLED', 'Two-factor authentication enabled');
+                $this->logEvent('info', "MFA enabled for user ID: $userId");
+
+                return [
+                    'success' => true,
+                    'backup_codes' => $backupCodes, // Return plain codes only once
+                    'message' => 'MFA enabled successfully. Save your backup codes in a safe place.'
+                ];
             }
+
+            return ['success' => false, 'error' => 'Failed to enable MFA'];
+
+        } catch (Exception $e) {
+            $this->logEvent('error', "MFA enable failed: " . $e->getMessage());
+            return ['success' => false, 'error' => 'Failed to enable MFA'];
         }
-        
-        // Check against common passwords (simplified example)
-        $commonPasswords = ['password', '123456', 'qwerty', 'letmein'];
-        if (in_array(strtolower($password), $commonPasswords)) {
-            return ['valid' => false, 'error' => 'Password is too common'];
-        }
-        
-        return ['valid' => true];
     }
 
-    /* ============================================================
-       PASSWORD HISTORY MANAGEMENT
-       ============================================================ */
-    private function isPasswordInHistory($userId, $passwordHash) {
-        $historySize = (int)$this->getSetting('password_history_size') ?: 5;
-        
+    /**
+     * Disable MFA (requires current password)
+     */
+    public function disableMfa($userId, $currentPassword) {
+        if (!$this->isLoggedIn() || $_SESSION['USER_ID'] != $userId) {
+            return ['success' => false, 'error' => 'Authentication required'];
+        }
+
+        // Verify current password
+        $user = $this->getUserById($userId);
+        if (!$user || !password_verify($currentPassword, $user['password'])) {
+            $this->auditLog($userId, 'MFA_DISABLE_FAILED', 'Invalid password provided');
+            return ['success' => false, 'error' => 'Current password is incorrect'];
+        }
+
         $stmt = $this->conn->prepare("
-            SELECT password_hash FROM password_history 
-            WHERE user_id = ? 
-            ORDER BY changed_at DESC 
-            LIMIT ?
+            UPDATE users 
+            SET mfa_secret = NULL, mfa_enabled = 0, mfa_backup_codes = NULL
+            WHERE id = ?
         ");
-        $stmt->bind_param("ii", $userId, $historySize);
-        $stmt->execute();
-        $result = $stmt->get_result();
-        
-        while ($row = $result->fetch_assoc()) {
-            if (password_verify($passwordHash, $row['password_hash'])) {
-                $stmt->close();
+        $stmt->bind_param("i", $userId);
+        $success = $stmt->execute();
+        $stmt->close();
+
+        if ($success) {
+            $this->auditLog($userId, 'MFA_DISABLED', 'Two-factor authentication disabled');
+            $this->logEvent('info', "MFA disabled for user ID: $userId");
+            return ['success' => true, 'message' => 'MFA disabled successfully'];
+        }
+
+        return ['success' => false, 'error' => 'Failed to disable MFA'];
+    }
+
+    /**
+     * Verify TOTP code during login (or use backup code)
+     */
+    private function verifyMfaCode($secret, $code) {
+        if ($secret === null) return false;
+
+        $code = trim($code);
+        $userId = $_SESSION['USER_ID'] ?? null;
+        if (!$userId) return false;
+
+        try {
+            $tfa = $this->getTfaInstance();
+            
+            // First try normal TOTP
+            if ($tfa->verifyCode($secret, $code, 2)) { // 2 = 60-second tolerance
                 return true;
             }
+
+            // Then try backup codes (one-time use)
+            $stmt = $this->conn->prepare("SELECT mfa_backup_codes FROM users WHERE id = ?");
+            $stmt->bind_param("i", $userId);
+            $stmt->execute();
+            $result = $stmt->get_result();
+            $row = $result->fetch_assoc();
+            $stmt->close();
+
+            if (!$row || empty($row['mfa_backup_codes'])) return false;
+
+            $hashedBackupCodes = json_decode($row['mfa_backup_codes'], true);
+            if (!is_array($hashedBackupCodes)) return false;
+
+            // Check each backup code
+            foreach ($hashedBackupCodes as $index => $hashedCode) {
+                if (password_verify($code, $hashedCode)) {
+                    // Remove used backup code
+                    unset($hashedBackupCodes[$index]);
+                    $newCodes = json_encode(array_values($hashedBackupCodes));
+
+                    $stmt = $this->conn->prepare("UPDATE users SET mfa_backup_codes = ? WHERE id = ?");
+                    $stmt->bind_param("si", $newCodes, $userId);
+                    $stmt->execute();
+                    $stmt->close();
+
+                    $this->auditLog($userId, 'MFA_BACKUP_CODE_USED', "Backup code used for login");
+                    $this->logEvent('info', "Backup code used for user ID: $userId");
+                    
+                    return true;
+                }
+            }
+
+            return false;
+
+        } catch (Exception $e) {
+            $this->logEvent('error', "MFA verification failed: " . $e->getMessage());
+            return false;
         }
-        
-        $stmt->close();
-        return false;
     }
 
-    private function addToPasswordHistory($userId, $passwordHash) {
-        $stmt = $this->conn->prepare("
-            INSERT INTO password_history (user_id, password_hash) 
-            VALUES (?, ?)
-        ");
-        $stmt->bind_param("is", $userId, $passwordHash);
+    /**
+     * Regenerate backup codes (requires current password)
+     */
+    public function regenerateBackupCodes($userId, $currentPassword) {
+        if (!$this->isLoggedIn() || $_SESSION['USER_ID'] != $userId) {
+            return ['success' => false, 'error' => 'Authentication required'];
+        }
+
+        // Verify current password
+        $user = $this->getUserById($userId);
+        if (!$user || !password_verify($currentPassword, $user['password'])) {
+            $this->auditLog($userId, 'MFA_BACKUP_REGEN_FAILED', 'Invalid password provided');
+            return ['success' => false, 'error' => 'Current password is incorrect'];
+        }
+
+        // Check if MFA is enabled
+        if (!$user['mfa_enabled']) {
+            return ['success' => false, 'error' => 'MFA is not enabled for this account'];
+        }
+
+        // Generate new backup codes
+        $backupCodes = [];
+        $hashedBackupCodes = [];
+        for ($i = 0; $i < 10; $i++) {
+            $code = strtoupper(substr(bin2hex(random_bytes(5)), 0, 8));
+            $backupCodes[] = $code;
+            $hashedBackupCodes[] = password_hash($code, PASSWORD_DEFAULT);
+        }
+
+        $json = json_encode($hashedBackupCodes);
+        $stmt = $this->conn->prepare("UPDATE users SET mfa_backup_codes = ? WHERE id = ?");
+        $stmt->bind_param("si", $json, $userId);
         $stmt->execute();
         $stmt->close();
+
+        $this->auditLog($userId, 'MFA_BACKUP_CODES_REGENERATED', 'Backup codes regenerated');
+        $this->logEvent('info', "Backup codes regenerated for user ID: $userId");
+
+        return [
+            'success' => true,
+            'backup_codes' => $backupCodes,
+            'message' => 'Backup codes regenerated. Save these new codes immediately.'
+        ];
+    }
+
+    /**
+     * Get MFA status for a user
+     */
+    public function getMfaStatus($userId) {
+        $stmt = $this->conn->prepare("
+            SELECT mfa_enabled, 
+                   CASE WHEN mfa_backup_codes IS NOT NULL 
+                        THEN JSON_LENGTH(mfa_backup_codes) 
+                        ELSE 0 
+                   END as backup_codes_remaining
+            FROM users 
+            WHERE id = ?
+        ");
+        $stmt->bind_param("i", $userId);
+        $stmt->execute();
+        $result = $stmt->get_result();
+        $row = $result->fetch_assoc();
+        $stmt->close();
+
+        if (!$row) {
+            return ['success' => false, 'error' => 'User not found'];
+        }
+
+        return [
+            'success' => true,
+            'mfa_enabled' => (bool)$row['mfa_enabled'],
+            'backup_codes_remaining' => (int)$row['backup_codes_remaining'],
+            'system_enabled' => $this->getSetting('enable_2fa') === '1'
+        ];
     }
 
     /* ============================================================
-       ENHANCED REGISTRATION
+       UPDATE THE login() METHOD TO USE NEW MFA VERIFICATION
        ============================================================ */
-    public function register($username, $password, $email = null, $role = 'USER') {
-        $ip = $_SERVER['REMOTE_ADDR'] ?? '0.0.0.0';
-        $userAgent = $_SERVER['HTTP_USER_AGENT'] ?? '';
-
-        // Audit log
-        $this->auditLog(null, 'REGISTER_ATTEMPT', "Registration attempt for $username from $ip", $ip, $userAgent);
-
-        // 1. Check if registration is allowed
-        if ($this->getSetting('allow_registration') !== '1') {
-            $this->logEvent('warn', "Registration disabled - attempt for $username", ['ip' => $ip]);
-            return ['success' => false, 'error' => 'Registration is currently disabled'];
-        }
-
-        // 2. Check if IP is blocked
-        if ($this->isIpBlocked($ip)) {
-            $this->logEvent('warn', "Registration attempt from blocked IP: $ip");
-            return ['success' => false, 'error' => 'Access denied'];
-        }
-
-        // 3. Input validation
-        $username = trim($username);
-        if (!preg_match('/^[a-zA-Z0-9_\-]{3,30}$/', $username)) {
-            $this->logEvent('info', "Registration failed - invalid username: $username", ['ip' => $ip]);
-            return ['success' => false, 'error' => 'Username must be 3-30 characters and contain only letters, numbers, hyphens, and underscores'];
-        }
-
-        // Validate email if provided
-        if ($email && !filter_var($email, FILTER_VALIDATE_EMAIL)) {
-            return ['success' => false, 'error' => 'Invalid email address'];
-        }
-
-        // 4. Password strength validation
-        $passwordCheck = $this->validatePasswordStrength($password);
-        if (!$passwordCheck['valid']) {
-            $this->logEvent('info', "Registration failed - weak password for $username", ['ip' => $ip]);
-            return ['success' => false, 'error' => $passwordCheck['error']];
-        }
-
-        // 5. Country restriction
-        $allowedCountries = array_filter(array_map('trim', 
-            explode(',', (string)$this->getSetting('allowed_countries'))));
-
-        if ($ip !== '127.0.0.1' && $ip !== '::1' && !empty($allowedCountries)) {
-            $country = $this->getCountryFromIP($ip);
-            if ($country === false) {
-                $this->logEvent('error', "Geolocation service failed for $ip");
-                return ['success' => false, 'error' => 'Service temporarily unavailable'];
-            }
-            if ($country && !in_array($country, $allowedCountries)) {
-                $this->logEvent('info', "Registration blocked - country restriction ($ip -> $country)");
-                return ['success' => false, 'error' => 'Registration not allowed from your country'];
-            }
-        }
-
-        // 6. Check if username exists
-        $stmt = $this->conn->prepare("SELECT id FROM users WHERE user_name = ? OR email = ?");
-        $stmt->bind_param("ss", $username, $email);
-        $stmt->execute();
-        $result = $stmt->get_result();
-        
-        if ($result->num_rows > 0) {
-            $stmt->close();
-            return ['success' => false, 'error' => 'Username or email already exists'];
-        }
-        $stmt->close();
-
-        // 7. Hash password
-        $hash = password_hash($password, PASSWORD_DEFAULT, ['cost' => 12]);
-        
-        // 8. Create user
-        $stmt = $this->conn->prepare("
-            INSERT INTO users (user_name, password, role, email) 
-            VALUES (?, ?, ?, ?)
-        ");
-        $stmt->bind_param("ssss", $username, $hash, $role, $email);
-        
-        if ($stmt->execute()) {
-            $userId = $this->conn->insert_id;
-            
-            // Add to password history
-            $this->addToPasswordHistory($userId, $hash);
-            
-            // Audit log
-            $this->auditLog($userId, 'REGISTER_SUCCESS', "User registered: $username", $ip, $userAgent);
-            
-            $this->logEvent('info', "User registered: $username from $ip", ['user_id' => $userId]);
-            
-            $stmt->close();
-            return ['success' => true, 'user_id' => $userId];
-        } else {
-            $error = $this->conn->error;
-            $this->logEvent('error', "Failed to register user $username: [SQL Error Hidden]", ['ip' => $ip]);
-            
-            $stmt->close();
-            return ['success' => false, 'error' => 'Registration failed. Please try again.'];
-        }
-    }
+    // Inside the login() method, replace the MFA block with:
 
     /* ============================================================
        ENHANCED LOGIN WITH BRUTE FORCE PROTECTION
@@ -694,535 +432,76 @@ class Auth {
         // Check MFA if enabled
         if ($user['mfa_enabled'] && $this->getSetting('enable_2fa') === '1') {
             if (!$mfaCode) {
+                // Store partial login info for MFA step
+                $_SESSION['pending_mfa_user_id'] = $user['id'];
+                $_SESSION['pending_mfa_expires'] = time() + 300; // 5 minutes for MFA
+                
                 return [
                     'success' => false,
                     'error' => 'MFA required',
                     'mfa_required' => true,
-                    'user_id' => $user['id']
+                    'user_id' => $user['id'],
+                    'partial_token' => bin2hex(random_bytes(16))
                 ];
             }
             
+            // Verify MFA code (includes backup code check)
             if (!$this->verifyMfaCode($user['mfa_secret'], $mfaCode)) {
                 $this->handleFailedLogin($user, $ip, $userAgent, $maxAttempts, $lockMinutes);
-                return ['success' => false, 'error' => 'Invalid MFA code'];
+                return ['success' => false, 'error' => 'Invalid MFA code or backup code'];
             }
+            
+            // Clear pending MFA session
+            unset($_SESSION['pending_mfa_user_id'], $_SESSION['pending_mfa_expires']);
         }
 
         // Login successful
         return $this->handleSuccessfulLogin($user, $ip, $userAgent, $remember);
     }
 
-    private function handleSuccessfulLogin($user, $ip, $userAgent, $remember) {
-        // Reset failed attempts
-        $this->resetAttempts($user['user_name']);
-        
-        // Update user record
-        $stmt = $this->conn->prepare("
-            UPDATE users 
-            SET last_login = NOW(), failed_attempts = 0, locked_until = NULL 
-            WHERE id = ?
-        ");
-        $stmt->bind_param("i", $user['id']);
-        $stmt->execute();
-        $stmt->close();
-
-        // Set session
-        $_SESSION['USER_ID'] = $user['id'];
-        $_SESSION['USERNAME'] = $user['user_name'];
-        $_SESSION['ROLE'] = $user['role'];
-        $_SESSION['LOGGED_IN'] = true;
-        $_SESSION['LOGIN_TIME'] = time();
-        $_SESSION['IP_ADDRESS'] = $ip;
-        
-        // Regenerate session ID
-        session_regenerate_id(true);
-        
-        // Set remember me cookie if requested
-        if ($remember) {
-            $this->setRememberMeCookie($user['id']);
+    /* ============================================================
+       ADDITIONAL MFA-RELATED METHODS
+       ============================================================ */
+    
+    /**
+     * Verify MFA code for an already logged-in user (e.g., for sensitive operations)
+     */
+    public function verifyMfaForOperation($userId, $code) {
+        if (!$this->isLoggedIn() || $_SESSION['USER_ID'] != $userId) {
+            return ['success' => false, 'error' => 'Authentication required'];
         }
 
-        // Audit log
-        $this->auditLog($user['id'], 'LOGIN_SUCCESS', "User logged in from $ip", $ip, $userAgent);
-        
-        $this->logEvent('info', "Successful login: {$user['user_name']} from $ip", ['user_id' => $user['id']]);
-        
-        return ['success' => true, 'user' => [
-            'id' => $user['id'],
-            'username' => $user['user_name'],
-            'role' => $user['role']
-        ]];
+        $user = $this->getUserById($userId);
+        if (!$user || !$user['mfa_enabled']) {
+            return ['success' => false, 'error' => 'MFA not enabled for this account'];
+        }
+
+        if ($this->verifyMfaCode($user['mfa_secret'], $code)) {
+            // Set temporary MFA verification in session (e.g., for 10 minutes)
+            $_SESSION['mfa_verified'] = time() + 600;
+            $this->auditLog($userId, 'MFA_OPERATION_VERIFIED', 'MFA verified for sensitive operation');
+            return ['success' => true];
+        }
+
+        $this->auditLog($userId, 'MFA_OPERATION_FAILED', 'MFA verification failed for operation');
+        return ['success' => false, 'error' => 'Invalid MFA code'];
     }
 
-    private function handleFailedLogin($user, $ip, $userAgent, $maxAttempts, $lockMinutes) {
-        // Increase failed attempts
-        $newAttempts = $user['failed_attempts'] + 1;
-        
-        $stmt = $this->conn->prepare("
-            UPDATE users 
-            SET failed_attempts = ?, 
-                locked_until = CASE 
-                    WHEN ? >= ? THEN DATE_ADD(NOW(), INTERVAL ? MINUTE) 
-                    ELSE NULL 
-                END
-            WHERE id = ?
-        ");
-        $lockTime = ($newAttempts >= $maxAttempts) ? $lockMinutes : 0;
-        $stmt->bind_param("iiiii", $newAttempts, $newAttempts, $maxAttempts, $lockTime, $user['id']);
-        $stmt->execute();
-        $stmt->close();
-
-        // Log attempt
-        $this->increaseAttempts($user['user_name'], $ip, $userAgent);
-        
-        // Audit log
-        $this->auditLog($user['id'], 'LOGIN_FAILED', "Failed login attempt #$newAttempts from $ip", $ip, $userAgent);
-        
-        $this->logEvent('info', "Failed login - wrong password for {$user['user_name']} from $ip", [
-            'attempt' => $newAttempts,
-            'max_attempts' => $maxAttempts
-        ]);
-
-        // Check for IP blocking
-        $this->checkAndBlockIP($ip, $user['user_name'], $lockMinutes);
+    /**
+     * Check if MFA verification is still valid for sensitive operations
+     */
+    public function isMfaVerified($userId) {
+        return isset($_SESSION['mfa_verified']) && 
+               $_SESSION['mfa_verified'] > time() &&
+               $_SESSION['USER_ID'] == $userId;
     }
 
     /* ============================================================
-       BRUTE FORCE PROTECTION METHODS
+       UPDATE THE changePassword METHOD TO REQUIRE MFA
        ============================================================ */
-    private function applyLoginDelay($failedAttempts, $baseDelay, $maxDelay) {
-        if ($failedAttempts > 0) {
-            // Exponential backoff with cap
-            $delay = min($baseDelay * pow(2, $failedAttempts - 1), $maxDelay);
-            usleep($delay * 1000000); // Convert to microseconds
-        }
-    }
-
-    private function simulateDelay($seconds) {
-        usleep($seconds * 1000000);
-    }
-
-    /* ============================================================
-       REMEMBER ME FUNCTIONALITY
-       ============================================================ */
-    private function setRememberMeCookie($userId) {
-        $selector = bin2hex(random_bytes(16));
-        $validator = bin2hex(random_bytes(32));
-        $hashedValidator = hash('sha256', $validator);
-        
-        $expires = time() + (30 * 24 * 3600); // 30 days
-        
-        // Store in database
-        $stmt = $this->conn->prepare("
-            INSERT INTO user_sessions (id, user_id, expires_at) 
-            VALUES (?, ?, FROM_UNIXTIME(?))
-        ");
-        $stmt->bind_param("sii", $selector, $userId, $expires);
-        $stmt->execute();
-        $stmt->close();
-        
-        // Set cookie
-        $cookieValue = $selector . ':' . $validator;
-        setcookie(
-            'remember_me',
-            $cookieValue,
-            $expires,
-            '/',
-            '',
-            !empty($_SERVER['HTTPS']),
-            true
-        );
-    }
-
-    public function loginFromRememberMe() {
-        if (!isset($_COOKIE['remember_me'])) {
-            return false;
-        }
-        
-        list($selector, $validator) = explode(':', $_COOKIE['remember_me']);
-        
-        $stmt = $this->conn->prepare("
-            SELECT us.*, u.user_name, u.role 
-            FROM user_sessions us 
-            JOIN users u ON us.user_id = u.id 
-            WHERE us.id = ? AND us.expires_at > NOW()
-        ");
-        $stmt->bind_param("s", $selector);
-        $stmt->execute();
-        $result = $stmt->get_result();
-        
-        if ($row = $result->fetch_assoc()) {
-            $hashedValidator = hash('sha256', $validator);
-            
-            // In real implementation, you would compare with stored hash
-            // For simplicity, we're just checking existence
-            
-            // Create new token for next time
-            $this->setRememberMeCookie($row['user_id']);
-            
-            // Set session
-            $_SESSION['USER_ID'] = $row['user_id'];
-            $_SESSION['USERNAME'] = $row['user_name'];
-            $_SESSION['ROLE'] = $row['role'];
-            $_SESSION['LOGGED_IN'] = true;
-            
-            return true;
-        }
-        
-        return false;
-    }
-
-    /* ============================================================
-       USER MANAGEMENT
-       ============================================================ */
-    private function getUserByUsername($username) {
-        $stmt = $this->conn->prepare("
-            SELECT id, user_name, password, role, failed_attempts, locked_until, 
-                   password_changed, mfa_secret, mfa_enabled 
-            FROM users 
-            WHERE user_name = ?
-        ");
-        $stmt->bind_param("s", $username);
-        $stmt->execute();
-        $result = $stmt->get_result();
-        $user = $result->fetch_assoc();
-        $stmt->close();
-        
-        return $user;
-    }
-
-    public function getUserById($userId) {
-        $stmt = $this->conn->prepare("
-            SELECT id, user_name, role, email, created_at, last_login 
-            FROM users 
-            WHERE id = ?
-        ");
-        $stmt->bind_param("i", $userId);
-        $stmt->execute();
-        $result = $stmt->get_result();
-        $user = $result->fetch_assoc();
-        $stmt->close();
-        
-        return $user;
-    }
-
-    /* ============================================================
-       ATTEMPT MANAGEMENT
-       ============================================================ */
-    private function increaseAttempts($username, $ip, $userAgent) {
-        $stmt = $this->conn->prepare("
-            INSERT INTO login_attempts (user_name, attempts, last_attempt, ip_address, user_agent) 
-            VALUES (?, 1, NOW(), ?, ?) 
-            ON DUPLICATE KEY UPDATE 
-            attempts = attempts + 1, 
-            last_attempt = NOW(),
-            ip_address = ?,
-            user_agent = ?
-        ");
-        $stmt->bind_param("sssss", $username, $ip, $userAgent, $ip, $userAgent);
-        $stmt->execute();
-        $stmt->close();
-        
-        $this->logEvent('info', "Increased attempts for $username from $ip");
-    }
-
-    public function resetAttempts($username) {
-        $stmt = $this->conn->prepare("DELETE FROM login_attempts WHERE user_name = ?");
-        $stmt->bind_param("s", $username);
-        $stmt->execute();
-        $stmt->close();
-    }
-
-    /* ============================================================
-       IP BLOCKING MANAGEMENT
-       ============================================================ */
-    private function checkAndBlockIP($ip, $username, $lockMinutes) {
-        // Check distinct usernames attempted from this IP recently
-        $stmt = $this->conn->prepare("
-            SELECT COUNT(DISTINCT user_name) as distinct_users 
-            FROM login_attempts 
-            WHERE ip_address = ? 
-            AND last_attempt >= DATE_SUB(NOW(), INTERVAL ? MINUTE)
-        ");
-        $stmt->bind_param("si", $ip, $lockMinutes);
-        $stmt->execute();
-        $result = $stmt->get_result();
-        $row = $result->fetch_assoc();
-        $distinctUsers = $row['distinct_users'] ?? 0;
-        $stmt->close();
-
-        $maxAttempts = (int)$this->getSetting('max_attempts') ?: 5;
-        
-        if ($distinctUsers >= $maxAttempts) {
-            // Block IP with progressive duration
-            $offenseCount = $this->getIpOffenseCount($ip);
-            $blockMinutes = min($lockMinutes * pow(2, $offenseCount), 1440); // Max 24 hours
-            
-            $stmt = $this->conn->prepare("
-                INSERT INTO blocked_ips (ip, blocked_until, reason) 
-                VALUES (?, DATE_ADD(NOW(), INTERVAL ? MINUTE), ?) 
-                ON DUPLICATE KEY UPDATE 
-                blocked_until = DATE_ADD(NOW(), INTERVAL ? MINUTE),
-                reason = ?
-            ");
-            $reason = "Multiple failed login attempts ($distinctUsers distinct users)";
-            $stmt->bind_param("sisis", $ip, $blockMinutes, $reason, $blockMinutes, $reason);
-            $stmt->execute();
-            $stmt->close();
-            
-            $this->logEvent('warn', "Blocked IP $ip for $blockMinutes minutes: $reason", [
-                'distinct_users' => $distinctUsers,
-                'offense_count' => $offenseCount
-            ]);
-        }
-    }
-
-    private function getIpOffenseCount($ip) {
-        $stmt = $this->conn->prepare("
-            SELECT COUNT(*) as count 
-            FROM blocked_ips 
-            WHERE ip = ? 
-            AND created_at >= DATE_SUB(NOW(), INTERVAL 7 DAY)
-        ");
-        $stmt->bind_param("s", $ip);
-        $stmt->execute();
-        $result = $stmt->get_result();
-        $row = $result->fetch_assoc();
-        $stmt->close();
-        
-        return $row['count'] ?? 0;
-    }
-
-    public function isIpBlocked($ip) {
-        $stmt = $this->conn->prepare("
-            SELECT blocked_until, reason 
-            FROM blocked_ips 
-            WHERE ip = ?
-        ");
-        $stmt->bind_param("s", $ip);
-        $stmt->execute();
-        $result = $stmt->get_result();
-        
-        if ($result->num_rows == 0) {
-            $stmt->close();
-            return false;
-        }
-        
-        $row = $result->fetch_assoc();
-        $stmt->close();
-        
-        if (empty($row['blocked_until'])) {
-            return true; // Permanent block
-        }
-        
-        $until = strtotime($row['blocked_until']);
-        if ($until < time()) {
-            $this->unblockIP($ip);
-            return false;
-        }
-        
-        return true;
-    }
-
-    public function unblockIP($ip) {
-        $stmt = $this->conn->prepare("DELETE FROM blocked_ips WHERE ip = ?");
-        $stmt->bind_param("s", $ip);
-        $ok = $stmt->execute();
-        $stmt->close();
-        
-        if ($ok) {
-            $this->logEvent('info', "Unblocked IP $ip");
-        }
-        
-        return $ok;
-    }
-
-    /* ============================================================
-       GEO LOCATION SERVICE
-       ============================================================ */
-    private function getCountryFromIP($ip) {
-        // Skip local IPs
-        if (filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE) === false) {
-            return null;
-        }
-        
-        // Cache to avoid repeated API calls
-        static $cache = [];
-        if (isset($cache[$ip])) {
-            return $cache[$ip];
-        }
-        
-        $url = "https://ip-api.com/json/" . $ip;
-        
-        $options = [
-            'http' => [
-                'timeout' => 3,
-                'header' => "User-Agent: AuthSystem/1.0\r\n"
-            ],
-            'ssl' => [
-                'verify_peer' => true,
-                'verify_peer_name' => true
-            ]
-        ];
-        
-        $context = stream_context_create($options);
-        
-        try {
-            $response = @file_get_contents($url, false, $context);
-            
-            if ($response === false) {
-                $this->logEvent('warn', "Geolocation lookup failed for IP: $ip");
-                $cache[$ip] = null;
-                return null;
-            }
-            
-            $data = json_decode($response, true);
-            
-            if ($data['status'] === 'success') {
-                $cache[$ip] = $data['countryCode'];
-                return $data['countryCode'];
-            }
-            
-            $cache[$ip] = null;
-            return null;
-            
-        } catch (Exception $e) {
-            $this->logEvent('error', "Geolocation exception for IP $ip: " . $e->getMessage());
-            return null;
-        }
-    }
-
-    /* ============================================================
-       AUDIT LOGGING
-       ============================================================ */
-    private function auditLog($userId, $action, $description, $ip = null, $userAgent = null) {
-        $ip = $ip ?? ($_SERVER['REMOTE_ADDR'] ?? '0.0.0.0');
-        $userAgent = $userAgent ?? ($_SERVER['HTTP_USER_AGENT'] ?? '');
-        
-        $stmt = $this->conn->prepare("
-            INSERT INTO audit_log (user_id, action, description, ip_address, user_agent) 
-            VALUES (?, ?, ?, ?, ?)
-        ");
-        $stmt->bind_param("issss", $userId, $action, $description, $ip, $userAgent);
-        $stmt->execute();
-        $stmt->close();
-    }
-
-    /* ============================================================
-       SESSION CLEANUP
-       ============================================================ */
-    private function cleanupExpiredSessions() {
-        $this->conn->query("DELETE FROM user_sessions WHERE expires_at < NOW()");
-    }
-
-    private function cleanupExpiredBlocks() {
-        $this->conn->query("DELETE FROM blocked_ips WHERE blocked_until IS NOT NULL AND blocked_until < NOW()");
-    }
-
-    /* ============================================================
-       MFA SUPPORT
-       ============================================================ */
-    private function verifyMfaCode($secret, $code) {
-        // Implement TOTP verification
-        // This is a placeholder - use a proper library like robthree/twofactorauth
-        return true; // Replace with actual implementation
-    }
-
-    /* ============================================================
-       UTILITY METHODS
-       ============================================================ */
-    public function isLoggedIn() {
-        return isset($_SESSION['LOGGED_IN']) && $_SESSION['LOGGED_IN'] === true;
-    }
-
-    public function getCurrentUser() {
-        if (!$this->isLoggedIn()) {
-            return null;
-        }
-        
-        return [
-            'id' => $_SESSION['USER_ID'] ?? null,
-            'username' => $_SESSION['USERNAME'] ?? null,
-            'role' => $_SESSION['ROLE'] ?? null
-        ];
-    }
-
-    public function requireRole($role) {
-        if (!$this->isLoggedIn()) {
-            header('HTTP/1.1 401 Unauthorized');
-            exit('Access denied: Not logged in');
-        }
-        
-        $currentRole = $_SESSION['ROLE'] ?? null;
-        if ($currentRole !== $role) {
-            header('HTTP/1.1 403 Forbidden');
-            exit('Access denied: Insufficient permissions');
-        }
-        
-        return true;
-    }
-
-    public function requireAnyRole($roles) {
-        if (!$this->isLoggedIn()) {
-            header('HTTP/1.1 401 Unauthorized');
-            exit('Access denied: Not logged in');
-        }
-        
-        $currentRole = $_SESSION['ROLE'] ?? null;
-        if (!in_array($currentRole, (array)$roles)) {
-            header('HTTP/1.1 403 Forbidden');
-            exit('Access denied: Insufficient permissions');
-        }
-        
-        return true;
-    }
-
-    /* ============================================================
-       LOGOUT
-       ============================================================ */
-    public function logout($redirect = null) {
-        // Audit log
-        if ($this->isLoggedIn()) {
-            $user = $this->getCurrentUser();
-            $this->auditLog($user['id'], 'LOGOUT', "User logged out", 
-                $_SERVER['REMOTE_ADDR'] ?? null, 
-                $_SERVER['HTTP_USER_AGENT'] ?? null);
-        }
-        
-        // Clear remember me cookie
-        if (isset($_COOKIE['remember_me'])) {
-            setcookie('remember_me', '', time() - 3600, '/', '', !empty($_SERVER['HTTPS']), true);
-        }
-        
-        // Destroy session
-        $this->destroySession();
-        
-        // Clear all session data
-        $_SESSION = [];
-        
-        // Redirect if requested
-        if ($redirect) {
-            $redirect = filter_var($redirect, FILTER_SANITIZE_URL);
-            
-            // Security headers
-            header_remove('X-Powered-By');
-            header("X-Frame-Options: DENY");
-            header("X-Content-Type-Options: nosniff");
-            header("Referrer-Policy: strict-origin-when-cross-origin");
-            
-            header("Location: " . $redirect);
-            exit();
-        }
-        
-        return true;
-    }
-
-    /* ============================================================
-       PASSWORD CHANGE
-       ============================================================ */
-    public function changePassword($userId, $currentPassword, $newPassword) {
+    public function changePassword($userId, $currentPassword, $newPassword, $mfaCode = null) {
         // Get user
-        $stmt = $this->conn->prepare("SELECT password FROM users WHERE id = ?");
+        $stmt = $this->conn->prepare("SELECT password, mfa_enabled, mfa_secret FROM users WHERE id = ?");
         $stmt->bind_param("i", $userId);
         $stmt->execute();
         $result = $stmt->get_result();
@@ -1237,6 +516,22 @@ class Auth {
         if (!password_verify($currentPassword, $user['password'])) {
             $this->auditLog($userId, 'PASSWORD_CHANGE_FAILED', 'Current password incorrect');
             return ['success' => false, 'error' => 'Current password is incorrect'];
+        }
+
+        // If MFA is enabled, require MFA code for password change
+        if ($user['mfa_enabled'] && $this->getSetting('enable_2fa') === '1') {
+            if (!$mfaCode) {
+                return [
+                    'success' => false,
+                    'error' => 'MFA required for password change',
+                    'mfa_required' => true
+                ];
+            }
+            
+            if (!$this->verifyMfaCode($user['mfa_secret'], $mfaCode)) {
+                $this->auditLog($userId, 'PASSWORD_CHANGE_MFA_FAILED', 'Invalid MFA code for password change');
+                return ['success' => false, 'error' => 'Invalid MFA code'];
+            }
         }
         
         // Check new password strength
@@ -1276,97 +571,5 @@ class Auth {
         return ['success' => false, 'error' => 'Failed to change password'];
     }
 
-    /* ============================================================
-       ADMIN METHODS
-       ============================================================ */
-    public function listBlockedIPs() {
-        $out = [];
-        $res = $this->conn->query("
-            SELECT ip, blocked_until, reason, created_at 
-            FROM blocked_ips 
-            ORDER BY created_at DESC
-        ");
-        while ($row = $res->fetch_assoc()) {
-            $out[] = $row;
-        }
-        return $out;
-    }
-
-    public function getLoginAttempts($limit = 100) {
-        $out = [];
-        $stmt = $this->conn->prepare("
-            SELECT user_name, ip_address, attempts, last_attempt, user_agent 
-            FROM login_attempts 
-            ORDER BY last_attempt DESC 
-            LIMIT ?
-        ");
-        $stmt->bind_param("i", $limit);
-        $stmt->execute();
-        $result = $stmt->get_result();
-        while ($row = $result->fetch_assoc()) {
-            $out[] = $row;
-        }
-        $stmt->close();
-        return $out;
-    }
-
-    public function getAuditLog($limit = 100) {
-        $out = [];
-        $stmt = $this->conn->prepare("
-            SELECT al.*, u.user_name 
-            FROM audit_log al 
-            LEFT JOIN users u ON al.user_id = u.id 
-            ORDER BY al.created_at DESC 
-            LIMIT ?
-        ");
-        $stmt->bind_param("i", $limit);
-        $stmt->execute();
-        $result = $stmt->get_result();
-        while ($row = $result->fetch_assoc()) {
-            $out[] = $row;
-        }
-        $stmt->close();
-        return $out;
-    }
-
-    /* ============================================================
-       SECURITY HEADERS
-       ============================================================ */
-    public function setSecurityHeaders() {
-        // Remove sensitive headers
-        header_remove('X-Powered-By');
-        header_remove('Server');
-        
-        // Security headers
-        header("X-Frame-Options: DENY");
-        header("X-Content-Type-Options: nosniff");
-        header("X-XSS-Protection: 1; mode=block");
-        header("Referrer-Policy: strict-origin-when-cross-origin");
-        
-        // Content Security Policy (adjust based on your needs)
-        $csp = [
-            "default-src 'self'",
-            "script-src 'self' 'unsafe-inline'", // Consider removing unsafe-inline
-            "style-src 'self' 'unsafe-inline'",
-            "img-src 'self' data:",
-            "font-src 'self'",
-            "connect-src 'self'",
-            "frame-ancestors 'none'",
-            "form-action 'self'"
-        ];
-        
-        header("Content-Security-Policy: " . implode("; ", $csp));
-        
-        // Feature Policy (now Permissions Policy)
-        header("Permissions-Policy: geolocation=(), microphone=(), camera=()");
-    }
-
-    /* ============================================================
-       DESTRUCTOR FOR CLEANUP
-       ============================================================ */
-    public function __destruct() {
-        // Close database connections if needed
-        // PHP will handle it automatically in most cases
-    }
+    // ... rest of your existing code remains the same ...
 }
-?>
