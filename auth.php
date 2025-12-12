@@ -15,20 +15,14 @@ class FortressAuth {
     private $tfa;
 
     public function __construct() {
-        // Auto-connect to database (works on 99% of hosts)
-        $this->db = @new mysqli(
-            $_SERVER['DB_HOST'] ?? 'localhost',
-            $_SERVER['DB_USER'] ?? 'root',
-            $_SERVER['DB_PASS'] ?? '',
-            $_SERVER['DB_NAME'] ?? 'Auth',
-            $_SERVER['DB_PORT'] ?? 3306
-        );
-
-        if ($this->db->connect_error) {
-            die("DB connection failed. Set DB env vars or edit this file.");
+        // Database connection delegated to db.php (get_db())
+        require_once __DIR__ . '/db.php';
+        try {
+            $this->db = get_db();
+        } catch (\Throwable $e) {
+            // Fail fast but give a clearer message for integrators
+            die('DB connection failed. Set DB env vars or provide a valid db.php: ' . $e->getMessage());
         }
-
-        $this->db->set_charset('utf8mb4');
         $this->autoSetup();           // ← This does ALL the magic
         $this->secureSessionStart();
         $this->loginFromRememberMe(); // Auto-login if cookie exists
