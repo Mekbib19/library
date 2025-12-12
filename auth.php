@@ -20,7 +20,7 @@ class FortressAuth {
             $_SERVER['DB_HOST'] ?? 'localhost',
             $_SERVER['DB_USER'] ?? 'root',
             $_SERVER['DB_PASS'] ?? '',
-            $_SERVER['DB_NAME'] ?? 'myapp',
+            $_SERVER['DB_NAME'] ?? 'Auth',
             $_SERVER['DB_PORT'] ?? 3306
         );
 
