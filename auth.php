@@ -98,26 +98,39 @@ class FortressAuth {
     // PUBLIC METHODS — JUST CALL THESE IN YOUR PAGES
     // ================================================================
 
-    public function login(string $username, string $password, bool $remember = false, ?string $mfa = null): array {
-        $user = $this->getUser($username);
-        if (!$user || !password_verify($password, $user['password'])) {
-            sleep(2); // Anti-brute
-            return ['success' => false, 'error' => 'Invalid credentials'];
-        }
+   public function login(string $username, string $password, bool $remember = false, ?string $mfa = null): array {
+    $user = $this->getUser($username);
 
-        if ($user['mfa_enabled'] && !$mfa) {
-            return ['success' => false, 'mfa_required' => true, 'user_id' => $user['id']];
-        }
-
-        if ($user['mfa_enabled'] && !$this->verifyMfa($user['mfa_secret'], $mfa)) {
-            return ['success' => false, 'error' => 'Wrong MFA code'];
-        }
-
-        $this->createSession($user);
-        if ($remember) $this->setRememberToken($user['id']);
-
-        return ['success' => true];
+    // === USER NOT FOUND OR WRONG PASSWORD ===
+    if (!$user || !password_verify($password, $user['password'])) {
+        // Increase failed attempts even for non-existent users (anti-enumeration)
+        $this->increaseFailedAttempt($username);
+        sleep(2);
+        return ['success' => false, 'error' => 'Invalid credentials'];
     }
+
+    // === ACCOUNT LOCKED ===
+    if ($user['locked_until'] && strtotime($user['locked_until']) > time()) {
+        return ['success' => false, 'error' => 'Account locked. Try again later.'];
+    }
+
+    // === MFA REQUIRED ===
+    if ($user['mfa_enabled'] && !$mfa) {
+        return ['success' => false, 'mfa_required' => true, 'user_id' => $user['id']];
+    }
+
+    if ($user['mfa_enabled'] && !$this->verifyMfa($user['mfa_secret'], $mfa)) {
+        $this->increaseFailedAttempt($username);
+        return ['success' => false, 'error' => 'Wrong MFA code'];
+    }
+
+    // === SUCCESS: Reset attempts & login ===
+    $this->resetFailedAttempts($user['id']);
+    $this->createSession($user);
+    if ($remember) $this->setRememberToken($user['id']);
+
+    return ['success' => true];
+}
 
     public function logout(): void {
         if (isset($_COOKIE['auth'])) setcookie('auth', '', time()-3600, '/');
@@ -171,6 +184,29 @@ class FortressAuth {
         }
         return false;
     }
+
+
+
+private function increaseFailedAttempt(string $username): void {
+    // Try to find user by username
+    $stmt = $this->db->prepare("UPDATE users SET failed_attempts = failed_attempts + 1, 
+        locked_until = CASE 
+            WHEN failed_attempts >= 4 THEN DATE_ADD(NOW(), INTERVAL 15 MINUTE)
+            ELSE locked_until 
+        END 
+        WHERE username = ?");
+    $stmt->bind_param("s", $username);
+    $stmt->execute();
+    $stmt->close();
+}
+
+private function resetFailedAttempts(int $userId): void {
+    $stmt = $this->db->prepare("UPDATE users SET failed_attempts = 0, locked_until = NULL WHERE id = ?");
+    $stmt->bind_param("i", $userId);
+    $stmt->execute();
+    $stmt->close();
+}
+
 
     // ================================================================
     // INTERNAL METHODS
